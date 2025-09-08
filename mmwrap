@@ -1,0 +1,780 @@
+#!/usr/bin/env bash
+
+# Author: Pooya Moradi
+# Date : 2025-08-12
+# License: MIT
+#
+# Description: A wrapper script to provide multimedia actions (alternative F-key
+#              actions) for minimal desktop environments
+#
+# Dependencies: playerctl wpctl notify-send
+#               xbacklight | brillo | brightnessctl
+#               dmenu | rofi | fuzzel
+
+version=0.24
+mmwrap_art_cache="/tmp/mmwrap-thumbnail"
+cache_dir=${XDG_CACHE_HOME:-$HOME/.cache}
+log_debug_flag=0
+
+# -------------------- User-Configurable Parameters ----------------
+
+# default cache paths, we prefer xx-large variation (tumblerd)
+thumb_dirs=("$cache_dir/thumbnails/xx-large"
+    "$cache_dir/thumbnails/large"
+    "$cache_dir/thumbnails/normal")
+
+# set notification icons depending on OS theme
+volume_icon_audio_muted="audio-volume-muted"
+volume_icon_audio_low="audio-volume-low"
+volume_icon_audio_medium="audio-volume-medium"
+volume_icon_audio_high="audio-volume-high"
+volume_icon_audio_toohigh="audio-volume-high-warning"
+volume_icon_mic_muted="audio-input-microphone-muted"  # microphone-sensitivity-muted
+volume_icon_mic_unmuted="audio-input-microphone-high" # audio-input-microphone
+backlight_icon="xfpm-brightness-lcd"                  # video-display-brightness
+player_icon_fallback="multimedia"                     # applications-multimedia
+
+# dependency preference, move left to prioritize
+preferred_selectors=(dmenu rofi fuzzel)
+preferred_backlights=(xbacklight brightnessctl brillo)
+
+# --------------- End of User-Configurable Parameters --------------
+
+show_help() {
+    cat << EOF
+A wrapper script for multimedia actions (F-keys)
+
+USAGE:
+  mmwrap [OPTIONS] SUBCOMMAND
+  mmwrap player {play-pause|next|prev|previous}
+  mmwrap player seek ±seconds
+    Control media playback
+  mmwrap volume ±percent
+    Increase/decrease volume level
+  mmwrap volume toggle-mute {speaker|mic|microphone}
+    Toggle source/sink mute state
+  mmwrap backlight ±percent
+    Increase/decrease screen backlight
+
+OPTIONS:
+    -V|--version
+        Print the script version
+    -v|--debug
+        Set log level to 'debug'
+    -h|--help
+        Print the help message
+EOF
+}
+
+cleanup() {
+    if [[ -f "$mmwrap_art_cache" ]]; then
+        log debug "deleting $mmwrap_art_cache"
+        rm -f "$mmwrap_art_cache"
+    fi
+}
+trap "cleanup" EXIT
+trap 'exit 3' SIGINT SIGTERM
+
+log() {
+    local mode
+    case "$1" in
+        "error")
+            mode="error"
+            ;;
+        "warn")
+            mode="warn"
+            ;;
+        "info")
+            mode="info"
+            ;;
+        "debug")
+            mode="debug"
+            ;;
+    esac
+    # skip debug logs if flag is not set
+    if [[ $mode == "debug" ]] && ((log_debug_flag != 1)); then
+        return
+    fi
+    printf >&2 "[%-5s] %s\n" "$mode" "$2"
+}
+
+check_deps() {
+    local app
+    local err=0
+    for app in "$@"; do
+        if ! command -v "$app" &> /dev/null; then
+            log error "dependency $app not found"
+            err=1
+        fi
+    done
+    ((err)) && exit "$err"
+}
+
+check_deps_any() {
+    local app
+    local err=1
+    for app in "$@"; do
+        if command -v "$app" &> /dev/null; then
+            printf "%s" "$app"
+            return
+        fi
+    done
+    log error "none of the dependencies '$*' were found (one is required)"
+    exit "$err"
+}
+
+selector() {
+    case $selector_app in
+        dmenu)
+            dmenu "$@"
+            ;;
+        rofi)
+            rofi -dmenu "$@"
+            ;;
+        fuzzel)
+            fuzzel --dmenu "$@"
+            ;;
+        *)
+            log error "unsupported selector app: $selector_app"
+            return 1
+            ;;
+    esac
+}
+
+# Reference: https://gist.github.com/cdown/1163649#file-gistfile1-sh
+urldecode() {
+    local url_encoded="${1//+/ }"
+    printf "%b" "${url_encoded//%/\\x}"
+}
+
+# Reference: https://github.com/dylanaraps/pure-bash-bible
+trim() {
+    : "${1#"${1%%[![:space:]]*}"}"
+    : "${_%"${_##*[![:space:]]}"}"
+    printf "%s\n" "$_"
+}
+
+
+player_get_metadata() {
+    local name key value
+    local last_key
+    while read -r name key value; do
+        # handle the case of some 'value' having newlines
+        if [[ -z "$name" ]] || [[ -z "$key" ]]; then
+            local line="$name$key$value"
+            local last_value="${media_metadata["$last_key"]}"
+            local curr_value
+            line=$(trim "$line")
+            last_value=$(trim "$last_value")
+            printf -v curr_value "%s%s%s" "$last_value" "\n" "$line"
+            media_metadata["$last_key"]="$curr_value"
+            continue
+        fi
+        media_metadata["$key"]="$value"
+        last_key="$key"
+    done < <(playerctl "${p_args[@]}" metadata | grep -v 'mpris:artUrl')
+
+    local seek_percent seek_str status
+    local fmt1="{{ (position) * 100 / (mpris:length) }}"
+    local fmt2="{{ duration(position) }} / {{ duration(mpris:length)}}"
+    local fmt3="{{ playerName }}"
+    local fmt4="{{ status }}"
+    if ! IFS=$',' read -r seek_percent seek_str name status < \
+        <(playerctl "${p_args[@]}" metadata \
+            --format "$fmt1,$fmt2,$fmt3,$fmt4"); then
+        log error "problem in extracting playerctl metadata"
+    fi
+    # round to the nearest int
+    printf -v seek_percent "%.0f" "$seek_percent"
+    media_metadata["seek_percent"]="$seek_percent"
+    media_metadata["seek_str"]="$seek_str"
+    media_metadata["player"]="$name"
+    media_metadata["status"]="$status"
+
+    # also add a non-empty UTF-8 title_str
+    if [[ -n ${media_metadata["xesam:title"]} ]]; then
+        media_metadata["title_str"]=${media_metadata["xesam:title"]}
+    else
+        # convert filename to a string, as a surrogate for title
+        local filename=${media_metadata['xesam:url']}
+        filename="${filename##*/}"        # get basename with ext
+        filename=$(urldecode "$filename") # decode to UTF-8
+        media_metadata["title_str"]="$filename"
+    fi
+}
+
+# We have to use a separate function to extract `mpris:artUrl` since mpv-mpris
+# returns a base64 encoded value of the media art which could be more than a MB
+# in size. In this case, bash's `read` would be slow and eventually break
+player_get_metadata_mpris_art_url() {
+    if ! playerctl "${p_args[@]}" metadata --format '{{ (mpris:artUrl) }}'; then
+        log error "problem in extracting playerctl metadata for 'mpris:artUrl'"
+        return 1
+    fi
+}
+
+player_get_brief_info() {
+    local msg=""
+    local album=${media_metadata['xesam:album']}
+    local artist=${media_metadata['xesam:artist']}
+    local title=${media_metadata['title_str']}
+    local seek_str=${media_metadata['seek_str']}
+
+    msg+="$title\n"
+
+    if [[ -n $album ]] && [[ -n $artist ]]; then
+        msg+="$album - $artist\n"
+    fi
+
+    if [[ -n $seek_str ]]; then
+        msg+="$seek_str"
+    fi
+
+    printf "%s" "$msg"
+}
+
+player_get_first_playing_player() {
+    mapfile -t player_ids <<< "$(playerctl --list-all)"
+
+    # find player_id of the first "Playing" player
+    for p in "${player_ids[@]}"; do
+        if [[ $(playerctl --player "$p" status) == "Playing" ]]; then
+            printf "%s" "$p"
+            return
+        fi
+    done
+}
+
+# IMO, this should be done in mpv-mpris itself
+player_get_thumbnail_cache() {
+    local media_hash
+    local media_uri
+    local media_art_url
+
+    media_uri="${media_metadata['xesam:url']}"
+    if [[ -z $media_uri ]]; then
+        return 1
+    fi
+
+    if ! media_hash=$(printf "%s" "$media_uri" \
+        | sed -z -e 's/\n$//' | md5sum); then
+        log error "failed to calculate MD5 hash of the media"
+        return 1
+    fi
+    # remove '-'
+    media_hash="${media_hash//-/}"
+    # remove trailing whitespace
+    media_hash="$(tr -d '[:space:]' <<< "$media_hash")"
+
+    # sanitize thumb_dirs, since find will exit on first non-existent path
+    local thumb_dirs_sanitized=()
+    local p
+    for p in "${thumb_dirs[@]}"; do
+        if [[ -d "$p" ]]; then
+            thumb_dirs_sanitized+=("$p")
+        fi
+    done
+    if [[ ${#thumb_dirs_sanitized[@]} -eq 0 ]]; then
+        log debug "no valid path to find thumbnails: ${thumb_dirs[*]}"
+        return 1
+    fi
+
+    # find the first matching hash
+    if ! media_art_url=$(find "${thumb_dirs_sanitized[@]}" \
+        -name "$media_hash.png" -print -quit); then
+        return 1
+    fi
+
+    if [[ -z "$media_art_url" ]]; then
+        return 1
+    fi
+    printf "%s" "$media_art_url"
+}
+
+player_get_art_url() {
+    local media_art_url
+
+    # try to find the art from system cache
+    if media_art_url=$(player_get_thumbnail_cache); then
+        log debug "cache hit"
+        printf "%s" "$media_art_url"
+        return
+    fi
+
+    # try to get art url from mpris
+    media_art_url=$(player_get_metadata_mpris_art_url)
+    if [[ -z $media_art_url ]]; then
+        local program
+        program="${media_metadata['player']}"
+        if [[ -n $program ]]; then
+            # simply use playing program's name as icon
+            media_art_url="$program"
+        else
+            media_art_url="multimedia"
+        fi
+    elif [[ ${media_art_url:0:4} == "data" ]]; then
+        # img_ext=$(printf "%s" "$media_art_url" | awk -F '[:/;,]' '{print $3}')
+        printf "%s" "$media_art_url" \
+            | cut -d ',' -f 2 \
+            | base64 -d > "$mmwrap_art_cache"
+        media_art_url="$mmwrap_art_cache"
+    fi
+    printf "%s" "$media_art_url"
+}
+
+player_pp_multi() {
+    declare -A players
+    local pause_all_flag
+    mapfile -t player_ids <<< "$(playerctl --list-all)"
+
+    # fill in the players associative array, with key being player_id and value
+    # being player media title_str
+    for p in "${player_ids[@]}"; do
+        p_args=(--player "$p")
+        # clear-out media_metadata first
+        declare -A media_metadata=()
+        player_get_metadata
+        players["$p"]="${media_metadata['title_str']}"
+    done
+
+    # check if any active player is in "Playing" state
+    for p in "${player_ids[@]}"; do
+        if [[ $(playerctl --player "$p" status) == "Playing" ]]; then
+            pause_all_flag=1
+            break
+        fi
+    done
+
+    # pause all players if flag is set
+    if ((pause_all_flag == 1)); then
+        playerctl --all-players pause
+        local titles
+        titles=$(printf "%s\n" "${players[@]}" | awk '{print "➤ " $0}')
+        notify-send -t 2500 -i "$player_icon_fallback" \
+            -h string:x-dunst-stack-tag:media-player \
+            "Paused All" \
+            "$titles"
+        return
+    fi
+
+    # now we are in all-paused state
+
+    # present available media to play via dmenu
+    selected_player=$(for p in "${!players[@]}"; do
+        printf "%-25s | %s\n" "$p" "${players[$p]}"
+    done \
+        | selector -l 3 -p "mmwrap:select (/${#player_ids[@]})" \
+        | awk -F '|' '{print $1}')
+
+    if [[ -z $selected_player ]]; then
+        return
+    fi
+    p_args=(--player "$selected_player")
+
+    # change the state of the selected_player to "Playing"
+    playerctl "${p_args[@]}" play || return 1
+
+    player_get_metadata
+
+    # present notification
+    local seek_percent
+    n_args=()
+    seek_percent="${media_metadata['seek_percent']}"
+    if [[ -n $seek_percent ]]; then
+        n_args+=(-h "int:value:$seek_percent")
+    fi
+    notify-send -t 2500 -i "$(player_get_art_url)" \
+        -h string:x-dunst-stack-tag:media-player \
+        "${n_args[@]}" \
+        "${media_metadata['status']}" \
+        "$(printf "%s\n%s" \
+            "${media_metadata[title_str]}" \
+            "${media_metadata['seek_str']}")"
+}
+
+handle_player() {
+    local mode="$1"
+    # check if any player is running
+    if playerctl --list-all 2>&1 | grep "No players found"; then
+        return 1
+    fi
+
+    selected_player="" # global variable
+    if ! selected_player=$(player_get_first_playing_player); then
+        log error "failed to get the first 'Playing' player"
+        return 1
+    fi
+
+    p_args=() # global variable
+    if [[ -n "$selected_player" ]]; then
+        p_args+=(--player "$selected_player")
+    fi
+
+    declare -A media_metadata # global variable
+
+    case $mode in
+        play-pause)
+            # check if multiple players are active
+            if players_count=$(playerctl --list-all | wc --lines); then
+                if ((players_count > 1)); then
+                    player_pp_multi
+                    return
+                fi
+            fi
+
+            # handle the case of only 1 player being active
+            playerctl play-pause || return 1
+
+            player_get_metadata
+
+            # present notification
+            local seek_percent
+            local args=()
+            seek_percent="${media_metadata['seek_percent']}"
+            if [[ -n $seek_percent ]]; then
+                args+=(-h "int:value:$seek_percent")
+            fi
+            notify-send -t 2500 -i "$(player_get_art_url)" \
+                -h string:x-dunst-stack-tag:media-player \
+                "${args[@]}" \
+                "${media_metadata['status']}" \
+                "$(player_get_brief_info)"
+            ;;
+        next)
+            if ! playerctl "${p_args[@]}" next; then
+                log error \
+                    "failed to skip to next track in '$selected_player'"
+            fi
+
+            # an extra run of playerctl is needed for the current metadata
+            # reporting to be correct, either this or a blocking sleep
+            playerctl "${p_args[@]}" metadata > /dev/null
+
+            player_get_metadata
+            notify-send -t 4500 -i "$(player_get_art_url)" \
+                -h string:x-dunst-stack-tag:media-player \
+                "${media_metadata['title_str']}" \
+                "${media_metadata['seek_str']}"
+            ;;
+        prev | previous)
+            if ! playerctl "${p_args[@]}" previous; then
+                log error \
+                    "failed to skip to previous track in '$selected_player'"
+            fi
+
+            # an extra run of playerctl is needed for the current metadata
+            # reporting to be correct, either this or a blocking sleep
+            playerctl "${p_args[@]}" metadata > /dev/null
+
+            player_get_metadata
+            notify-send -t 4500 -i "$(player_get_art_url)" \
+                -h string:x-dunst-stack-tag:media-player \
+                "${media_metadata['title_str']}" \
+                "${media_metadata['seek_str']}"
+            ;;
+        seek)
+            local val="$2"
+            # handle + or - case
+            if [[ ${val:0:1} == "-" ]]; then
+                # remove - char (if given)
+                val=${val//-/}
+                playerctl "${p_args[@]}" position "$val"- || return 1
+            else
+                # remove + char (if given)
+                val=${val//+/}
+                playerctl "${p_args[@]}" position "$val"+ || return 1
+            fi
+
+            player_get_metadata
+
+            # present notification
+            local n_args=()
+            seek_percent="${media_metadata['seek_percent']}"
+            if [[ -n $seek_percent ]]; then
+                n_args+=(-h "int:value:$seek_percent")
+            fi
+
+            notify-send -t 2500 -i "$(player_get_art_url)" \
+                -h string:x-dunst-stack-tag:media-player \
+                "${n_args[@]}" \
+                "${media_metadata['status']}" \
+                "$(player_get_brief_info)"
+            ;;
+        -h | --help | help)
+            show_help
+            exit 0
+            ;;
+        *)
+            log error "Unsupported argument: $1"
+            exit 2
+            ;;
+    esac
+}
+
+volume_get_icon() {
+    local val="$1"
+    local icon
+    if ((val == 0)); then
+        icon="$volume_icon_audio_muted"
+    elif ((val <= 10)); then
+        icon="$volume_icon_audio_low"
+    elif ((val <= 30)); then
+        icon="$volume_icon_audio_medium"
+    elif ((val <= 100)); then
+        icon="$volume_icon_audio_high"
+    else
+        icon="$volume_icon_audio_toohigh"
+    fi
+    printf "%s" "$icon"
+}
+
+handle_volume() {
+    local val="$1"
+    local icon
+    local id
+
+    case $val in
+        toggle-mute)
+            shift
+            case $1 in
+                speaker)
+                    id="@DEFAULT_AUDIO_SINK@"
+                    wpctl set-mute "$id" toggle
+
+                    # present notification
+                    if wpctl get-volume "$id" | grep -qi "muted"; then
+                        icon="$volume_icon_audio_muted"
+                        notify-send -i "$icon" -t 750 \
+                            -h string:x-dunst-stack-tag:audio \
+                            "Audio muted!"
+                    else
+                        volume_value="$(wpctl get-volume "$id" \
+                            | awk '{print ($2 * 100)}')"
+                        icon="$(volume_get_icon "$volume_value")"
+                        notify-send -i "$icon" -t 750 \
+                            -h string:x-dunst-stack-tag:audio \
+                            -h int:value:"$volume_value" \
+                            "$volume_value%"
+                    fi
+                    return
+                    ;;
+                microphone | mic)
+                    id="@DEFAULT_AUDIO_SOURCE@"
+                    wpctl set-mute "$id" toggle
+
+                    # present notification
+                    if wpctl get-volume "$id" | grep -qi "muted"; then
+                        icon="$volume_icon_mic_muted"
+                        notify-send -i "$icon" -t 750 \
+                            -h string:x-dunst-stack-tag:audio \
+                            "Microphone muted!"
+                    else
+                        icon="$volume_icon_mic_unmuted"
+                        notify-send -i "$icon" -t 750 \
+                            -h string:x-dunst-stack-tag:audio \
+                            "Microphone unmuted"
+                    fi
+                    return
+                    ;;
+                -h | --help | help)
+                    show_help
+                    exit 0
+                    ;;
+                *)
+                    log error "Unsupported argument: $1"
+                    exit 2
+                    ;;
+            esac
+            ;;
+        -h | --help | help)
+            show_help
+            exit 0
+            ;;
+    esac
+
+    # remove % char (if given)
+    val=${val//%/}
+
+    # handle + or - case
+    if [[ ${val:0:1} == "-" ]]; then
+        # remove - char (if given)
+        val=${val//-/}
+        wpctl set-volume @DEFAULT_AUDIO_SINK@ "$val"%-
+    else
+        # remove + char (if given)
+        val=${val//+/}
+        wpctl set-volume @DEFAULT_AUDIO_SINK@ "$val"%+
+    fi
+    # get updated volume value, needed for rendering progress-bar
+    volume_value="$(wpctl get-volume @DEFAULT_AUDIO_SINK@ \
+        | awk '{print ($2 * 100)}')"
+    icon=$(volume_get_icon "$volume_value")
+    notify-send -i "$icon" -t 750 \
+        -h string:x-dunst-stack-tag:audio \
+        -h int:value:"$volume_value" \
+        "$volume_value%"
+}
+
+backlight_driver_get() {
+    case $backlight_app in
+        xbacklight)
+            xbacklight -get
+            ;;
+        brightnessctl)
+            local curr
+            local max
+            local ratio_percent
+            curr=$(brightnessctl get)
+            max=$(brightnessctl max)
+            ratio_percent=$((curr * 100 / max))
+            printf "%s" "$ratio_percent"
+            ;;
+        brillo)
+            brillo -G
+            ;;
+        *)
+            log error "unsupported backlight driver: $backlight_app"
+            return 1
+            ;;
+    esac
+}
+
+backlight_driver_set() {
+    local op="$1"
+    local val="$2"
+    case $backlight_app in
+        xbacklight)
+            case $op in
+                inc)
+                    xbacklight -inc "$val"
+                    ;;
+                dec)
+                    xbacklight -dec "$val"
+                    ;;
+            esac
+            ;;
+        brightnessctl)
+            case $op in
+                inc)
+                    brightnessctl set "$val"%+
+                    ;;
+                dec)
+                    brightnessctl set "$val"%-
+                    ;;
+            esac
+            ;;
+        brillo)
+            case $op in
+                inc)
+                    brillo -A "$val"
+                    ;;
+                dec)
+                    brillo -U "$val"
+                    ;;
+            esac
+            ;;
+        *)
+            log error "unsupported backlight driver: $backlight_app"
+            return 1
+            ;;
+    esac
+
+}
+
+handle_backlight() {
+    local val="$1"
+    local backlight_value
+
+    case $val in
+        -h | --help | help)
+            show_help
+            exit 0
+            ;;
+    esac
+
+    # remove % char (if given)
+    val=${val//%/}
+
+    # handle + or - case
+    if [[ ${val:0:1} == "-" ]]; then
+        # remove - char (if given)
+        val=${val//-/}
+        backlight_driver_set dec "$val" || return 1
+    else
+        # remove + char (if given)
+        val=${val//+/}
+        backlight_driver_set inc "$val" || return 1
+    fi
+
+    # get updated backlight value, needed for rendering progress-bar
+    backlight_value=$(backlight_driver_get) || return 1
+
+    # send notification
+    notify-send -i "$backlight_icon" -t 750 \
+        -h string:x-dunst-stack-tag:backlight \
+        -h int:value:"$backlight_value" \
+        "$backlight_value %"
+
+}
+
+handle_cmd() {
+    local cmd="$1"
+    shift
+    case $cmd in
+        player)
+            check_deps playerctl
+            selector_app="" # global variable
+            selector_app=$(check_deps_any "${preferred_selectors[@]}") \
+                || exit 1
+            handle_player "$@"
+            ;;
+        volume)
+            check_deps wpctl
+            handle_volume "$@"
+            ;;
+        backlight)
+            backlight_app="" # global variable
+            backlight_app=$(check_deps_any "${preferred_backlights[@]}") \
+                || exit 1
+            handle_backlight "$@"
+            ;;
+        "")
+            show_help
+            ;;
+        *)
+            log error "Unknown subcommand: $cmd"
+            exit 2
+            ;;
+    esac
+}
+
+while :; do
+    case $1 in
+        -h | --help | help)
+            show_help
+            exit
+            ;;
+        -V | --version)
+            printf "%s\n" "$version"
+            exit
+            ;;
+        -v | --debug)
+            log_debug_flag=1
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -?*)
+            log warn "Unknown option (ignored): $1"
+            ;;
+        *)
+            break
+            ;;
+    esac
+    shift
+done
+
+check_deps notify-send
+
+handle_cmd "$@"
