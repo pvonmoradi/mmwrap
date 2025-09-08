@@ -60,11 +60,12 @@ sudo apt install mpv mpv-mpris # or vlc
 Three subcommands are available: `player`, `volume` and `backlight`. Check
 `mmwrap -h` for description:
 
-```bash
+```console
 $ mmwrap -h
-A Wrapper script for multimedia actions (F-keys)
+A wrapper script for multimedia actions (F-keys)
 
 USAGE:
+  mmwrap [OPTIONS] SUBCOMMAND
   mmwrap player {play-pause|next|prev|previous}
   mmwrap player seek ±seconds
     Control media playback
@@ -99,10 +100,34 @@ file of the key-binder daemon in a format like this:
 
 *`bind_cmd`* [`XF86Symbol`](https://wiki.linuxquestions.org/wiki/XF86_keyboard_symbols) *`exec_cmd`* `mmwrap SUBCOMMAND ARGS`
 
-For example, here is how the script can be used in an i3 config file:
+For example, here is how the script can be used in an i3wm config file:
 
 ```config
-bindsym XF86AudioRaiseVolume exec --no-startup-id mmwrap volume +10%
+# keyboard multimedia functions keybindings
+# audio: volume adjustment (±5%)
+bindsym XF86AudioRaiseVolume exec --no-startup-id mmwrap volume +5%
+bindsym XF86AudioLowerVolume exec --no-startup-id mmwrap volume -5%
+
+# audio: speaker/mic mute toggle
+bindsym XF86AudioMute    exec --no-startup-id mmwrap volume toggle-mute speaker
+bindsym XF86AudioMicMute exec --no-startup-id mmwrap volume toggle-mute mic
+
+# brightness: intensity adjustment (±10%)
+bindsym XF86MonBrightnessUp   exec --no-startup-id mmwrap backlight +10%
+bindsym XF86MonBrightnessDown exec --no-startup-id mmwrap backlight -10%
+
+# media control: play/pause(F9)
+bindsym XF86Tools    exec --no-startup-id mmwrap player play-pause
+
+# media control: next(F12)
+bindsym XF86Explorer exec --no-startup-id mmwrap player next
+
+# media control: prev(F11)
+bindsym XF86LaunchA  exec --no-startup-id mmwrap player prev
+
+# media control: seeking by ±5 seconds
+bindsym Shift+XF86Explorer exec --no-startup-id mmwrap player seek +5
+bindsym Shift+XF86LaunchA  exec --no-startup-id mmwrap player seek -5
 ```
 
 ## Customization
