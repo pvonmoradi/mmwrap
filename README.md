@@ -21,8 +21,8 @@ speaker or changing the display backlight intensity.
 Download the `mmwrap` script, make it executable and move it to somewhere on
 `$PATH` (e.g. `~/bin` or `~/.local/bin`):
 
-```bash
-wget https://github.com/pvonmoradi/mmwrap/mmwrap -O ~/bin/mmwrap
+```shell
+wget https://github.com/pvonmoradi/mmwrap/raw/refs/heads/master/mmwrap -O ~/bin/mmwrap
 chmod +x ~/bin/mmwrap
 ```
 
